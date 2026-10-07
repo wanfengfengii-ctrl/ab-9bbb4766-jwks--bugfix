@@ -1,0 +1,10 @@
+.git
+.gitignore
+*.md
+docker-compose.override.yml
+.tmp
+/tmp
+/bin
+/out
+*.test
+*.out
