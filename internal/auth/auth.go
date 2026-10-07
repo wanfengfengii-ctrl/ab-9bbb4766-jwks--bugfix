@@ -3,7 +3,6 @@
 package auth
 
 import (
-	"crypto/ecdsa"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -45,7 +44,7 @@ type Params struct {
 	ExpectedIssuer   string
 	ExpectedAudience string
 	ExpectedSubject  string
-	IssuerKey        *ecdsa.PublicKey
+	IssuerKeys       *KeySet
 	PublicOrigin     string // e.g. https://api.example.lab
 	HTUPath          string // /api/calibration-bundles/{id}
 	Now              time.Time
@@ -110,8 +109,20 @@ func Verify(accessToken, dpopProof string, p Params) (*Decision, error) {
 	if typ, _ := tok.Header["typ"].(string); typ != "" && typ != "JWT" {
 		return nil, fail(CodeInvalidToken, 401, "access token typ must be JWT, got %q", typ)
 	}
-	if err := jwx.VerifyES256(tok, p.IssuerKey); err != nil {
-		return nil, fail(CodeInvalidToken, 401, "access token signature rejected by registered issuer key: %v", err)
+	// Resolve the registered verification key from the optional kid: a present
+	// kid pins exactly one registered key, an absent kid makes every registered
+	// key equally eligible (JWKS order is irrelevant).
+	kid, kidPresent := tok.Header["kid"]
+	kidStr, kidOK := kid.(string)
+	if kidPresent && (!kidOK || strings.TrimSpace(kidStr) == "") {
+		return nil, fail(CodeInvalidToken, 401, "access token kid must be a non-empty string")
+	}
+	candidates, err := p.IssuerKeys.resolve(kidStr, kidPresent)
+	if err != nil {
+		return nil, fail(CodeInvalidToken, 401, "%v", err)
+	}
+	if err := jwx.VerifyES256Any(tok, candidates); err != nil {
+		return nil, fail(CodeInvalidToken, 401, "access token signature rejected by registered issuer key(s): %v", err)
 	}
 
 	var claims accessClaims

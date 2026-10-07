@@ -31,6 +31,10 @@ func newRig(t *testing.T) *rig {
 	x, y := jwx.XY(&dpop.PublicKey)
 	now := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
 	path := "/api/calibration-bundles/B-1"
+	keys, err := auth.NewKeySet([]auth.IssuerKey{{Key: &issuer.PublicKey}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	return &rig{
 		t:      t,
 		issuer: issuer,
@@ -42,7 +46,7 @@ func newRig(t *testing.T) *rig {
 			ExpectedIssuer:   "https://issuer.example",
 			ExpectedAudience: "calibration-api",
 			ExpectedSubject:  "partner-a",
-			IssuerKey:        &issuer.PublicKey,
+			IssuerKeys:       keys,
 			PublicOrigin:     "https://api.example",
 			HTUPath:          path,
 			Now:              now,
@@ -308,6 +312,118 @@ func TestAudienceArray(t *testing.T) {
 	proof := r.proof(tok, proofOpts{})
 	if _, err := auth.Verify(tok, proof, r.params); err != nil {
 		t.Fatalf("aud array containing target must pass: %v", err)
+	}
+}
+
+// signAccess mints an access token with an arbitrary protected header (so kid
+// handling can be exercised) signed by signKey.
+func (r *rig) signAccess(header map[string]any, signKey *ecdsa.PrivateKey) string {
+	claims := map[string]any{
+		"iss":   r.params.ExpectedIssuer,
+		"sub":   r.params.ExpectedSubject,
+		"aud":   r.params.ExpectedAudience,
+		"iat":   r.now.Add(-10 * time.Second).Unix(),
+		"exp":   r.now.Add(2 * time.Minute).Unix(),
+		"scope": "bundles:read",
+		"cnf":   map[string]any{"jkt": r.jkt},
+	}
+	pb, _ := json.Marshal(claims)
+	if header == nil {
+		header = map[string]any{"alg": "ES256", "typ": "JWT"}
+	}
+	tok, err := jwx.SignCompact(header, pb, jwx.ES256Signer{Key: signKey})
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	return tok
+}
+
+func keySet(t *testing.T, keys ...auth.IssuerKey) *auth.KeySet {
+	t.Helper()
+	ks, err := auth.NewKeySet(keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ks
+}
+
+func TestIssuerJWKSKeyRotation(t *testing.T) {
+	key1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	key2, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	foreign, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+
+	// Register key1 first and key2 second: the rotating-in key must be just as
+	// trusted as the first entry.
+	ordered := []auth.IssuerKey{
+		{KID: "key-1", Key: &key1.PublicKey},
+		{KID: "key-2", Key: &key2.PublicKey},
+	}
+	// Same set declared in reverse order; verdicts must be identical.
+	reversed := []auth.IssuerKey{
+		{KID: "key-2", Key: &key2.PublicKey},
+		{KID: "key-1", Key: &key1.PublicKey},
+	}
+	// Keys without kids (e.g. bare JWKs) must also participate in no-kid lookups.
+	unnamed := []auth.IssuerKey{
+		{Key: &key1.PublicKey},
+		{Key: &key2.PublicKey},
+	}
+	// Two keys sharing one kid: a presented kid cannot be uniquely resolved.
+	ambiguous := []auth.IssuerKey{
+		{KID: "dup", Key: &key1.PublicKey},
+		{KID: "dup", Key: &key2.PublicKey},
+	}
+
+	cases := []struct {
+		name   string
+		keys   []auth.IssuerKey
+		header map[string]any
+		sign   *ecdsa.PrivateKey
+		want   auth.ErrorCode // "" means success
+	}{
+		{"second key, no kid", ordered, nil, key2, ""},
+		{"first key, no kid", ordered, nil, key1, ""},
+		{"second key, no kid, reversed order", reversed, nil, key2, ""},
+		{"first key, no kid, reversed order", reversed, nil, key1, ""},
+		{"second key pinned by kid", ordered, map[string]any{"alg": "ES256", "typ": "JWT", "kid": "key-2"}, key2, ""},
+		{"first key pinned by kid, second position in set", reversed, map[string]any{"alg": "ES256", "typ": "JWT", "kid": "key-1"}, key1, ""},
+		{"unnamed second key, no kid", unnamed, nil, key2, ""},
+		{"unknown kid rejected", ordered, map[string]any{"alg": "ES256", "typ": "JWT", "kid": "key-9"}, key2, auth.CodeInvalidToken},
+		{"kid present but signed by a different registered key", ordered, map[string]any{"alg": "ES256", "typ": "JWT", "kid": "key-1"}, key2, auth.CodeInvalidToken},
+		{"ambiguous kid rejected", ambiguous, map[string]any{"alg": "ES256", "typ": "JWT", "kid": "dup"}, key2, auth.CodeInvalidToken},
+		{"empty-string kid rejected", ordered, map[string]any{"alg": "ES256", "typ": "JWT", "kid": ""}, key2, auth.CodeInvalidToken},
+		{"non-string kid rejected", ordered, map[string]any{"alg": "ES256", "typ": "JWT", "kid": 7}, key2, auth.CodeInvalidToken},
+		{"foreign signature rejected against full set", ordered, nil, foreign, auth.CodeInvalidToken},
+		{"foreign signature not rescued by matching kid", ordered, map[string]any{"alg": "ES256", "typ": "JWT", "kid": "key-2"}, foreign, auth.CodeInvalidToken},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRig(t)
+			r.params.IssuerKeys = keySet(t, tc.keys...)
+			tok := r.signAccess(tc.header, tc.sign)
+			proof := r.proof(tok, proofOpts{})
+			_, err := auth.Verify(tok, proof, r.params)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("want success, got %v", err)
+				}
+				return
+			}
+			ae, ok := auth.AsError(err)
+			if !ok || ae.Code != tc.want {
+				t.Fatalf("want %s, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
+func TestNewKeySetRejectsEmptyOrNilKeys(t *testing.T) {
+	if _, err := auth.NewKeySet(nil); err == nil {
+		t.Fatal("empty key set must be rejected")
+	}
+	key1, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if _, err := auth.NewKeySet([]auth.IssuerKey{{KID: "a", Key: &key1.PublicKey}, {}}); err == nil {
+		t.Fatal("nil key entry must be rejected")
 	}
 }
 

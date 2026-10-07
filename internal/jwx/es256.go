@@ -50,12 +50,9 @@ func SignCompact(header map[string]any, payload []byte, signer Signer) (string, 
 // VerifyES256 validates a parsed JWS against the given P-256 public key.
 // Accepts only the fixed-length raw R||S signature form used by JWT/DPoP.
 func VerifyES256(jws *JWS, pub *ecdsa.PublicKey) error {
-	sig, err := Decode(jws.Signature())
+	sig, err := decodeES256Signature(jws)
 	if err != nil {
-		return errors.New("malformed signature encoding")
-	}
-	if len(sig) != 64 {
-		return errors.New("invalid ES256 signature length")
+		return err
 	}
 	digest := sha256.Sum256([]byte(jws.SigningInput()))
 	r := new(big.Int).SetBytes(sig[:32])
@@ -66,10 +63,46 @@ func VerifyES256(jws *JWS, pub *ecdsa.PublicKey) error {
 	return nil
 }
 
+// VerifyES256Any validates a parsed JWS when the signing key is not known in
+// advance: the signature must verify under at least one of the registered
+// candidate keys. Every candidate has equal standing — iteration order never
+// changes the verdict, since a valid ES256 signature cannot verify under two
+// distinct keys. It returns an error when no candidate accepts the signature.
+func VerifyES256Any(jws *JWS, pubs []*ecdsa.PublicKey) error {
+	sig, err := decodeES256Signature(jws)
+	if err != nil {
+		return err
+	}
+	digest := sha256.Sum256([]byte(jws.SigningInput()))
+	r := new(big.Int).SetBytes(sig[:32])
+	s := new(big.Int).SetBytes(sig[32:])
+	for _, pub := range pubs {
+		if pub == nil {
+			continue
+		}
+		if ecdsa.Verify(pub, digest[:], r, s) {
+			return nil
+		}
+	}
+	return errors.New("signature verification failed against every registered issuer key")
+}
+
+func decodeES256Signature(jws *JWS) ([]byte, error) {
+	sig, err := Decode(jws.Signature())
+	if err != nil {
+		return nil, errors.New("malformed signature encoding")
+	}
+	if len(sig) != 64 {
+		return nil, errors.New("invalid ES256 signature length")
+	}
+	return sig, nil
+}
+
 // PublicJWK is the subset of an EC JWK needed for verification.
 type PublicJWK struct {
 	Kty string `json:"kty"`
 	Crv string `json:"crv"`
+	Kid string `json:"kid"`
 	X   string `json:"x"`
 	Y   string `json:"y"`
 }

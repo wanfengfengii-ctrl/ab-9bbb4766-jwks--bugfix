@@ -2,10 +2,10 @@
 package server
 
 import (
-	"crypto/ecdsa"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -38,10 +38,10 @@ type preparedBundle struct {
 
 // Server holds the immutable, validated serving state.
 type Server struct {
-	cfg       *config.Config
-	issuerKey *ecdsa.PublicKey
-	replay    *store.ReplayStore
-	bundles   map[string]*preparedBundle
+	cfg        *config.Config
+	issuerKeys *auth.KeySet
+	replay     *store.ReplayStore
+	bundles    map[string]*preparedBundle
 
 	healthy   atomic.Bool
 	startedAt time.Time
@@ -49,24 +49,28 @@ type Server struct {
 	rejected  atomic.Int64
 }
 
-// New validates the issuer key, opens the durable replay log and prepares every
-// configured bundle (sizes and digests) for serving.
+// New validates the issuer key set, opens the durable replay log and prepares
+// every configured bundle (sizes and digests) for serving.
 func New(cfg *config.Config, replay *store.ReplayStore) (*Server, error) {
 	raw, err := os.ReadFile(cfg.IssuerJWK)
 	if err != nil {
 		return nil, fmt.Errorf("load issuer jwk: %w", err)
 	}
-	pub, err := parseIssuerKey(raw)
+	registered, err := parseIssuerKeys(raw)
 	if err != nil {
-		return nil, nil
+		return nil, err
+	}
+	keys, err := auth.NewKeySet(registered)
+	if err != nil {
+		return nil, err
 	}
 
 	s := &Server{
-		cfg:       cfg,
-		issuerKey: pub,
-		replay:    replay,
-		bundles:   map[string]*preparedBundle{},
-		startedAt: time.Now().UTC(),
+		cfg:        cfg,
+		issuerKeys: keys,
+		replay:     replay,
+		bundles:    map[string]*preparedBundle{},
+		startedAt:  time.Now().UTC(),
 	}
 	for i := range cfg.Bundles {
 		pb, err := prepareBundle(&cfg.Bundles[i])
@@ -79,19 +83,45 @@ func New(cfg *config.Config, replay *store.ReplayStore) (*Server, error) {
 	return s, nil
 }
 
-// parseIssuerKey accepts either a bare JWK or a JWKS {"keys":[...]}.
-func parseIssuerKey(raw []byte) (*ecdsa.PublicKey, error) {
-	var wrap struct {
-		Keys []json.RawMessage `json:"keys"`
+// parseIssuerKeys accepts a bare JWK or a JWKS document {"keys":[...]}.
+//
+// Every key in a JWKS is registered with equal verification standing: token
+// selection happens via the token header kid or, absent one, by trying every
+// registered key, so the order of "keys" can never privilege a particular
+// key. Each entry must be a valid P-256 EC public JWK; an unknown/invalid entry
+// or an empty key set fails startup rather than being silently skipped.
+func parseIssuerKeys(raw []byte) ([]auth.IssuerKey, error) {
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return nil, fmt.Errorf("registered issuer key: malformed JSON: %w", err)
 	}
-	if err := json.Unmarshal(raw, &wrap); err == nil && len(wrap.Keys) > 0 {
-		raw = wrap.Keys[0]
+	var entries [][]byte
+	if keysRaw, ok := probe["keys"]; ok {
+		var wrap struct {
+			Keys []json.RawMessage `json:"keys"`
+		}
+		if err := json.Unmarshal(keysRaw, &wrap.Keys); err != nil {
+			return nil, fmt.Errorf("registered issuer keys: malformed keys array: %w", err)
+		}
+		if len(wrap.Keys) == 0 {
+			return nil, errors.New("registered issuer keys: JWKS keys array is empty")
+		}
+		for _, k := range wrap.Keys {
+			entries = append(entries, k)
+		}
+	} else {
+		entries = [][]byte{raw}
 	}
-	pub, _, err := jwx.ParsePublicJWK(raw)
-	if err != nil {
-		return nil, fmt.Errorf("registered issuer key: %w", err)
+
+	out := make([]auth.IssuerKey, 0, len(entries))
+	for i, e := range entries {
+		pub, jwk, err := jwx.ParsePublicJWK(e)
+		if err != nil {
+			return nil, fmt.Errorf("registered issuer key #%d: %w", i+1, err)
+		}
+		out = append(out, auth.IssuerKey{KID: jwk.Kid, Key: pub})
 	}
-	return pub, nil
+	return out, nil
 }
 
 func prepareBundle(b *config.Bundle) (*preparedBundle, error) {
@@ -163,7 +193,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		ExpectedIssuer:   s.cfg.Issuer,
 		ExpectedAudience: s.cfg.Audience,
 		ExpectedSubject:  s.cfg.Subject,
-		IssuerKey:        s.issuerKey,
+		IssuerKeys:       s.issuerKeys,
 		PublicOrigin:     s.cfg.PublicOrigin,
 		HTUPath:          r.URL.Path,
 		Now:              now,

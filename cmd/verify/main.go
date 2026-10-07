@@ -146,6 +146,9 @@ func main() {
 	rep.check("used proof cannot be replayed after server restart",
 		s.restartPersistence(*serverBin, *cfgPath))
 
+	// ---- Phase 7: issuer JWKS rotation (multi-key, kid selection) ----
+	s.jwksRotation(rep, *serverBin)
+
 	log.Printf("----- verify summary: %d/%d checks passed -----", rep.total-rep.failed, rep.total)
 	if rep.failed != 0 {
 		log.Fatalf("VERIFY FAILED: %d check(s) failed", rep.failed)
@@ -937,6 +940,304 @@ func (s *smoke) restartPersistence(bin, cfgPath string) error {
 		return fmt.Errorf("fresh proof's replay after restart: want 409, got %d/%s", info.status, info.code)
 	}
 	return nil
+}
+
+// --------------------- issuer JWKS rotation ---------------------
+
+// jwksRotation exercises issuer key rotation against real server processes:
+// a JWKS may carry several valid P-256 keys, and every one of them must verify
+// regardless of array position; a token kid must pin exactly the matching
+// registered key, unknown/ambiguous/empty kids must stay rejected, and bare
+// JWKs plus single-entry JWKS keep their existing semantics.
+func (s *smoke) jwksRotation(rep *report, bin string) {
+	if _, err := os.Stat(bin); err != nil {
+		rep.check("jwks: server binary available", fmt.Errorf("server binary %s unavailable: %w", bin, err))
+		return
+	}
+	rep.check("jwks: server binary available", nil)
+
+	now := time.Now().UTC()
+	key1, _ := minting.GenerateP256()
+	key2, _ := minting.GenerateP256()
+	foreign, _ := minting.GenerateP256()
+
+	pubJWK := func(key *ecdsa.PrivateKey, kid string) map[string]any {
+		x, y := jwx.XY(&key.PublicKey)
+		m := map[string]any{"kty": "EC", "crv": "P-256", "x": jwx.Encode(x), "y": jwx.Encode(y)}
+		if kid != "" {
+			m["kid"] = kid
+		}
+		return m
+	}
+
+	root, err := os.MkdirTemp("", "jwks-rotate-")
+	if err != nil {
+		rep.check("jwks: scratch setup", err)
+		return
+	}
+	defer os.RemoveAll(root)
+
+	docIndex := 0
+	writeDoc := func(v any) string {
+		docIndex++
+		p := filepath.Join(root, fmt.Sprintf("issuer-%d.json", docIndex))
+		b, _ := json.MarshalIndent(v, "", "  ")
+		if err := os.WriteFile(p, b, 0o644); err != nil {
+			rep.check("jwks: write issuer document", err)
+		}
+		return p
+	}
+	jwksDoc := func(entries ...map[string]any) string {
+		return writeDoc(struct {
+			Keys []map[string]any `json:"keys"`
+		}{Keys: entries})
+	}
+
+	type instance struct {
+		proc   *os.Process
+		client *smoke
+		dir    string
+	}
+	start := func(name, docPath string) *instance {
+		dir := filepath.Join(root, name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			rep.check("jwks: "+name+" replay dir", err)
+			return nil
+		}
+		cfgCopy := *s.cfg
+		cfgCopy.IssuerJWK = docPath
+		cfgPath := filepath.Join(root, name+".config.json")
+		cb, _ := json.MarshalIndent(&cfgCopy, "", "  ")
+		if err := os.WriteFile(cfgPath, cb, 0o644); err != nil {
+			rep.check("jwks: "+name+" config", err)
+			return nil
+		}
+		port := freeTCPPort()
+		base := fmt.Sprintf("http://127.0.0.1:%d", port)
+		cmd := exec.Command(bin)
+		cmd.Env = append(os.Environ(),
+			"CONFIG_PATH="+cfgPath,
+			"REPLAY_DIR="+dir,
+			fmt.Sprintf("LISTEN_ADDR=:%d", port),
+		)
+		var logBuf lineLog
+		cmd.Stdout = &logBuf
+		cmd.Stderr = &logBuf
+		if err := cmd.Start(); err != nil {
+			rep.check("jwks: "+name+" start", err)
+			return nil
+		}
+		if err := waitHealthy(base+"/healthz", 20*time.Second); err != nil {
+			_ = cmd.Process.Kill()
+			rep.check("jwks: "+name+" healthy", fmt.Errorf("%w; logs: %s", err, logBuf.String()))
+			return nil
+		}
+		rep.check("jwks: "+name+" healthy", nil)
+		return &instance{
+			proc: cmd.Process,
+			client: &smoke{cfg: s.cfg, base: base, origin: s.origin,
+				client: &http.Client{Timeout: 10 * time.Second}},
+			dir: dir,
+		}
+	}
+	stop := func(inst *instance) {
+		if inst == nil {
+			return
+		}
+		_ = inst.proc.Signal(syscall.SIGTERM)
+		done := make(chan struct{})
+		go func() { _, _ = inst.proc.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			_ = inst.proc.Kill()
+			<-done
+		}
+	}
+
+	// expect performs one download on inst and asserts the stable outcome.
+	type attempt struct {
+		signer     *ecdsa.PrivateKey
+		kid        string
+		kidPresent bool
+		wantStatus int
+		wantCode   string
+		wantBytes  bool
+	}
+	expect := func(instName string, inst *instance, a attempt) {
+		name := fmt.Sprintf("jwks: %s kid=%q(present=%t)", instName, a.kid, a.kidPresent)
+		if inst == nil {
+			rep.check(name, fmt.Errorf("server instance unavailable"))
+			return
+		}
+		tok, err := s.tokenWithKid(now, a.kid, a.kidPresent, a.signer)
+		if err != nil {
+			rep.check(name, err)
+			return
+		}
+		pr, err := s.proof(tok, proofSpec{})
+		if err != nil {
+			rep.check(name, err)
+			return
+		}
+		info, err := inst.client.doGet(tok, pr, s.bundlePath(s.bundleID))
+		if err != nil {
+			rep.check(name, err)
+			return
+		}
+		if info.status != a.wantStatus || info.code != a.wantCode {
+			rep.check(name, fmt.Errorf("want %d/%s, got %d/%s (%s)",
+				a.wantStatus, a.wantCode, info.status, info.code, info.body))
+			return
+		}
+		if a.wantBytes && !bytes.Equal(info.body, s.expected) {
+			rep.check(name, fmt.Errorf("200 body is not byte-identical to evidence"))
+			return
+		}
+		rep.check(name, nil)
+	}
+
+	ok200 := attempt{wantStatus: 200, wantCode: "", wantBytes: true}
+
+	// Primary rotation JWKS: key1 first, current signing key key2 second.
+	primary := start("primary", jwksDoc(pubJWK(key1, "issuer-1"), pubJWK(key2, "issuer-2")))
+	if primary != nil {
+		a := ok200
+		a.signer = key2 // second entry, no kid: the reported regression
+		expect("second-key no kid", primary, a)
+
+		a = ok200
+		a.signer = key1 // first entry, no kid
+		expect("first-key no kid", primary, a)
+
+		a = ok200
+		a.signer = key2
+		a.kid, a.kidPresent = "issuer-2", true // kid pins the second key
+		expect("second-key matching kid", primary, a)
+
+		a = ok200
+		a.signer = key1
+		a.kid, a.kidPresent = "issuer-1", true
+		expect("first-key matching kid", primary, a)
+
+		// Illegal/ambiguous credentials must never be accepted.
+		for _, a := range []attempt{
+			{signer: key2, kid: "issuer-unknown", kidPresent: true, wantStatus: 401, wantCode: "invalid_token"},
+			{signer: key2, kid: "issuer-1", kidPresent: true, wantStatus: 401, wantCode: "invalid_token"}, // kid names another key
+			{signer: key2, kid: "", kidPresent: true, wantStatus: 401, wantCode: "invalid_token"},         // explicit empty kid
+			{signer: foreign, wantStatus: 401, wantCode: "invalid_token"},                                 // unregistered key
+			{signer: foreign, kid: "issuer-2", kidPresent: true, wantStatus: 401, wantCode: "invalid_token"},
+		} {
+			expect("reject", primary, a)
+		}
+	}
+
+	// Same two keys in reverse order: verdicts must be identical.
+	reversed := start("reversed", jwksDoc(pubJWK(key2, "issuer-2"), pubJWK(key1, "issuer-1")))
+	if reversed != nil {
+		a := ok200
+		a.signer = key2
+		expect("reversed second-position key no kid", reversed, a)
+		a = ok200
+		a.signer = key1
+		expect("reversed first-position key no kid", reversed, a)
+	}
+
+	// Duplicate kid: presented kid is ambiguous and rejected; without a kid the
+	// distinct keys still verify on signature alone.
+	ambiguous := start("ambiguous", jwksDoc(pubJWK(key1, "dup"), pubJWK(key2, "dup")))
+	if ambiguous != nil {
+		expect("ambiguous kid", ambiguous,
+			attempt{signer: key2, kid: "dup", kidPresent: true, wantStatus: 401, wantCode: "invalid_token"})
+		a := ok200
+		a.signer = key2
+		expect("ambiguous set no kid", ambiguous, a)
+	}
+
+	// Single-entry JWKS: the lone key works (with and without kid); an
+	// unregistered sibling key is rejected.
+	single := start("single", jwksDoc(pubJWK(key2, "only")))
+	if single != nil {
+		a := ok200
+		a.signer = key2
+		a.kid, a.kidPresent = "only", true
+		expect("single-entry kid", single, a)
+		a = ok200
+		a.signer = key2
+		expect("single-entry no kid", single, a)
+		expect("single-entry foreign key", single,
+			attempt{signer: key1, wantStatus: 401, wantCode: "invalid_token"})
+	}
+
+	// Bare JWK (no "keys" wrapper): backward-compatible single-key trust.
+	bare := start("bare", writeDoc(pubJWK(key1, "")))
+	if bare != nil {
+		a := ok200
+		a.signer = key1
+		expect("bare jwk registered key", bare, a)
+		expect("bare jwk rejects unregistered key", bare,
+			attempt{signer: key2, wantStatus: 401, wantCode: "invalid_token"})
+	}
+
+	// An empty JWKS must fail closed at startup rather than serving with no
+	// registered verification key.
+	emptyPath := writeDoc(struct {
+		Keys []map[string]any `json:"keys"`
+	}{})
+	emptyDir := filepath.Join(root, "empty-replay")
+	_ = os.MkdirAll(emptyDir, 0o755)
+	emptyCfg := filepath.Join(root, "empty.config.json")
+	emptyConfig := *s.cfg
+	emptyConfig.IssuerJWK = emptyPath
+	cb, _ := json.MarshalIndent(&emptyConfig, "", "  ")
+	_ = os.WriteFile(emptyCfg, cb, 0o644)
+	port := freeTCPPort()
+	emptyBase := fmt.Sprintf("http://127.0.0.1:%d", port)
+	cmd := exec.Command(bin)
+	cmd.Env = append(os.Environ(), "CONFIG_PATH="+emptyCfg, "REPLAY_DIR="+emptyDir,
+		fmt.Sprintf("LISTEN_ADDR=:%d", port))
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	startErr := cmd.Start()
+	if startErr == nil {
+		healthyErr := waitHealthy(emptyBase+"/healthz", 8*time.Second)
+		if healthyErr == nil {
+			rep.check("jwks: empty JWKS must fail startup", fmt.Errorf("server became healthy with zero issuer keys"))
+			_ = cmd.Process.Kill()
+		} else {
+			rep.check("jwks: empty JWKS must fail startup", nil)
+		}
+		_, _ = cmd.Process.Wait()
+	} else {
+		rep.check("jwks: empty JWKS must fail startup", startErr)
+	}
+
+	for _, inst := range []*instance{primary, reversed, ambiguous, single, bare} {
+		stop(inst)
+	}
+}
+
+// tokenWithKid mints an access token signed by signKey, optionally carrying a
+// kid in its protected header.
+func (s *smoke) tokenWithKid(now time.Time, kid string, kidPresent bool, signKey *ecdsa.PrivateKey) (string, error) {
+	claims := map[string]any{
+		"iss":   s.cfg.Issuer,
+		"sub":   s.cfg.Subject,
+		"aud":   s.cfg.Audience,
+		"iat":   now.Add(-10 * time.Second).Unix(),
+		"exp":   now.Add(3 * time.Minute).Unix(),
+		"scope": "bundles:read",
+		"cnf":   map[string]any{"jkt": s.jkt},
+	}
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		return "", err
+	}
+	header := map[string]any{"alg": "ES256", "typ": "JWT"}
+	if kidPresent {
+		header["kid"] = kid
+	}
+	return jwx.SignCompact(header, payload, jwx.ES256Signer{Key: signKey})
 }
 
 // ----------------------------- helpers -----------------------------

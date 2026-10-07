@@ -35,7 +35,21 @@ DPoP:          <ES256 DPoP proof JWT>
 
 ### Access token validation
 
-Registered issuer ES256 public JWK; verified claims: `alg=ES256`, `iss`,
+Registered issuer ES256 public key set: `issuer_jwk_path` points at either a
+bare public JWK or a JWKS document (`{"keys":[...]}`) containing one or more
+valid P-256 keys. Every registered key has equal verification standing — key
+rotation registers old and new keys side by side, and the order of `keys`
+never affects a verdict. Key selection:
+
+- token header carries `kid`: it must match exactly one registered JWK `kid`;
+  an unknown or non-unique `kid` is rejected with `invalid_token` (no
+  cryptographic fallback);
+- token carries no `kid`: the signature may verify under **any** registered
+  key, so the first `keys` entry is not privileged;
+- an empty JWKS, or any invalid entry (wrong `kty`/`crv`, malformed point),
+  fails server startup.
+
+Verified claims: `alg=ES256`, `iss`,
 `aud` (string or array), `sub`, `exp`/`nbf` (with leeway), `scope`/`permissions`
 containing `bundles:read`, and `cnf.jkt` (RFC 7638 SHA-256 thumbprint of the
 caller key).
@@ -126,6 +140,17 @@ Rules enforced at load: 1–8 files per bundle, numbers 1–8 unique, digests ar
 non-symlink files without any write bit. Env overrides: `PUBLIC_ORIGIN`,
 `ISSUER`, `AUDIENCE`, `SUBJECT`, `ISSUER_JWK_PATH`, `LISTEN_ADDR`/`PORT`,
 `CONFIG_PATH`, `REPLAY_DIR`.
+
+For key rotation, point `issuer_jwk_path` at a JWKS and keep old and new
+public keys registered simultaneously; tokens signed by either key verify
+(optionally pinned with a per-JWK `kid`), independent of array order:
+
+```json
+{"keys": [
+  {"kty": "EC", "crv": "P-256", "kid": "2025-09", "x": "…", "y": "…"},
+  {"kty": "EC", "crv": "P-256", "kid": "2026-10", "x": "…", "y": "…"}
+]}
+```
 
 ## Local development
 
