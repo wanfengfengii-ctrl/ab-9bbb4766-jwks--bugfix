@@ -45,13 +45,21 @@ type Params struct {
 	ExpectedIssuer   string
 	ExpectedAudience string
 	ExpectedSubject  string
-	IssuerKey        *ecdsa.PublicKey
-	PublicOrigin     string // e.g. https://api.example.lab
-	HTUPath          string // /api/calibration-bundles/{id}
-	Now              time.Time
-	AccessLeeway     time.Duration
-	ProofMaxAge      time.Duration
-	ProofLeeway      time.Duration
+	// IssuerKeys are the registered issuer verification keys (the JWKS at
+	// issuer_jwk_path). Every key has equal standing: a token carrying a kid
+	// selects the one registered key with that kid, while a token without a
+	// kid may verify against any of them. When empty, the single IssuerKey
+	// below is used.
+	IssuerKeys []jwx.RegisteredKey
+	// IssuerKey is the single registered issuer key for single-key
+	// deployments; consulted only when IssuerKeys is empty.
+	IssuerKey    *ecdsa.PublicKey
+	PublicOrigin string // e.g. https://api.example.lab
+	HTUPath      string // /api/calibration-bundles/{id}
+	Now          time.Time
+	AccessLeeway time.Duration
+	ProofMaxAge  time.Duration
+	ProofLeeway  time.Duration
 }
 
 // Decision is the result of a fully validated token+proof pair.
@@ -110,8 +118,8 @@ func Verify(accessToken, dpopProof string, p Params) (*Decision, error) {
 	if typ, _ := tok.Header["typ"].(string); typ != "" && typ != "JWT" {
 		return nil, fail(CodeInvalidToken, 401, "access token typ must be JWT, got %q", typ)
 	}
-	if err := jwx.VerifyES256(tok, p.IssuerKey); err != nil {
-		return nil, fail(CodeInvalidToken, 401, "access token signature rejected by registered issuer key: %v", err)
+	if err := verifyAccessSignature(tok, p); err != nil {
+		return nil, err
 	}
 
 	var claims accessClaims
@@ -236,6 +244,71 @@ func Verify(accessToken, dpopProof string, p Params) (*Decision, error) {
 	}
 
 	return &Decision{Subject: claims.Subject, ProofJTI: pc.JTI}, nil
+}
+
+// verifyAccessSignature checks the access-token signature against the
+// registered issuer keys. A token kid selects deterministically: exactly one
+// registered key must carry that kid, and no other key is tried. A token
+// without a kid may verify against any registered key — every key in the
+// JWKS has equal standing, so document order never decides the outcome.
+func verifyAccessSignature(tok *jwx.JWS, p Params) error {
+	keys := p.IssuerKeys
+	if len(keys) == 0 && p.IssuerKey != nil {
+		keys = []jwx.RegisteredKey{{Public: p.IssuerKey}}
+	}
+	if len(keys) == 0 {
+		return fail(CodeInvalidToken, 401, "no registered issuer key is configured")
+	}
+
+	kid, hasKid, err := accessTokenKid(tok)
+	if err != nil {
+		return fail(CodeInvalidToken, 401, "%v", err)
+	}
+	if hasKid {
+		var match *jwx.RegisteredKey
+		matches := 0
+		for i := range keys {
+			if keys[i].Kid != "" && keys[i].Kid == kid {
+				matches++
+				match = &keys[i]
+			}
+		}
+		switch {
+		case matches == 0:
+			return fail(CodeInvalidToken, 401, "access token kid %q matches no registered issuer key", kid)
+		case matches > 1:
+			return fail(CodeInvalidToken, 401, "access token kid %q matches %d registered issuer keys; cannot select uniquely", kid, matches)
+		}
+		if err := jwx.VerifyES256(tok, match.Public); err != nil {
+			return fail(CodeInvalidToken, 401, "access token signature rejected by registered issuer key (kid %q): %v", kid, err)
+		}
+		return nil
+	}
+
+	for i := range keys {
+		if jwx.VerifyES256(tok, keys[i].Public) == nil {
+			return nil
+		}
+	}
+	return fail(CodeInvalidToken, 401, "access token signature rejected by every registered issuer key")
+}
+
+// accessTokenKid extracts the optional kid member of the token's protected
+// header. A present but non-string kid is rejected; an empty or blank kid is
+// treated as absent.
+func accessTokenKid(tok *jwx.JWS) (kid string, present bool, err error) {
+	raw, ok := tok.Header["kid"]
+	if !ok {
+		return "", false, nil
+	}
+	s, ok := raw.(string)
+	if !ok {
+		return "", false, errors.New("access token kid must be a string")
+	}
+	if strings.TrimSpace(s) == "" {
+		return "", false, nil
+	}
+	return s, true, nil
 }
 
 func within(now time.Time, iat, exp int64, nbf *int64, leeway time.Duration) bool {

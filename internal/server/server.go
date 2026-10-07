@@ -2,7 +2,6 @@
 package server
 
 import (
-	"crypto/ecdsa"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -38,10 +37,10 @@ type preparedBundle struct {
 
 // Server holds the immutable, validated serving state.
 type Server struct {
-	cfg       *config.Config
-	issuerKey *ecdsa.PublicKey
-	replay    *store.ReplayStore
-	bundles   map[string]*preparedBundle
+	cfg        *config.Config
+	issuerKeys []jwx.RegisteredKey
+	replay     *store.ReplayStore
+	bundles    map[string]*preparedBundle
 
 	healthy   atomic.Bool
 	startedAt time.Time
@@ -49,24 +48,24 @@ type Server struct {
 	rejected  atomic.Int64
 }
 
-// New validates the issuer key, opens the durable replay log and prepares every
-// configured bundle (sizes and digests) for serving.
+// New validates the issuer key set, opens the durable replay log and prepares
+// every configured bundle (sizes and digests) for serving.
 func New(cfg *config.Config, replay *store.ReplayStore) (*Server, error) {
 	raw, err := os.ReadFile(cfg.IssuerJWK)
 	if err != nil {
 		return nil, fmt.Errorf("load issuer jwk: %w", err)
 	}
-	pub, err := parseIssuerKey(raw)
+	keys, err := jwx.ParsePublicKeySet(raw)
 	if err != nil {
-		return nil, nil
+		return nil, fmt.Errorf("registered issuer keys: %w", err)
 	}
 
 	s := &Server{
-		cfg:       cfg,
-		issuerKey: pub,
-		replay:    replay,
-		bundles:   map[string]*preparedBundle{},
-		startedAt: time.Now().UTC(),
+		cfg:        cfg,
+		issuerKeys: keys,
+		replay:     replay,
+		bundles:    map[string]*preparedBundle{},
+		startedAt:  time.Now().UTC(),
 	}
 	for i := range cfg.Bundles {
 		pb, err := prepareBundle(&cfg.Bundles[i])
@@ -77,21 +76,6 @@ func New(cfg *config.Config, replay *store.ReplayStore) (*Server, error) {
 	}
 	s.healthy.Store(true)
 	return s, nil
-}
-
-// parseIssuerKey accepts either a bare JWK or a JWKS {"keys":[...]}.
-func parseIssuerKey(raw []byte) (*ecdsa.PublicKey, error) {
-	var wrap struct {
-		Keys []json.RawMessage `json:"keys"`
-	}
-	if err := json.Unmarshal(raw, &wrap); err == nil && len(wrap.Keys) > 0 {
-		raw = wrap.Keys[0]
-	}
-	pub, _, err := jwx.ParsePublicJWK(raw)
-	if err != nil {
-		return nil, fmt.Errorf("registered issuer key: %w", err)
-	}
-	return pub, nil
 }
 
 func prepareBundle(b *config.Bundle) (*preparedBundle, error) {
@@ -163,7 +147,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		ExpectedIssuer:   s.cfg.Issuer,
 		ExpectedAudience: s.cfg.Audience,
 		ExpectedSubject:  s.cfg.Subject,
-		IssuerKey:        s.issuerKey,
+		IssuerKeys:       s.issuerKeys,
 		PublicOrigin:     s.cfg.PublicOrigin,
 		HTUPath:          r.URL.Path,
 		Now:              now,

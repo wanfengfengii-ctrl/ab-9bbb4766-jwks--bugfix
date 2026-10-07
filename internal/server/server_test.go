@@ -38,6 +38,22 @@ func setup(t *testing.T) *harness {
 	t.Helper()
 	dir := t.TempDir()
 
+	issuer, err := minting.GenerateP256()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubPath, _, err := minting.SaveKeyPair(dir, issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return newHarness(t, issuer, pubPath, dir)
+}
+
+// newHarness builds a serving harness around an already-provisioned issuer
+// JWK document (bare JWK or JWKS) at jwkPath.
+func newHarness(t *testing.T, issuer *ecdsa.PrivateKey, jwkPath, dir string) *harness {
+	t.Helper()
+
 	body1 := []byte("calibration-report\n")
 	body2 := []byte{0x00, 0x01, 0x02, 0xFF}
 	p1 := filepath.Join(dir, "01-report.txt")
@@ -49,15 +65,7 @@ func setup(t *testing.T) *harness {
 		t.Fatal(err)
 	}
 
-	issuer, err := minting.GenerateP256()
-	if err != nil {
-		t.Fatal(err)
-	}
 	dpop, err := minting.GenerateP256()
-	if err != nil {
-		t.Fatal(err)
-	}
-	pubPath, _, err := minting.SaveKeyPair(dir, issuer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +79,7 @@ func setup(t *testing.T) *harness {
 		Issuer:          "https://issuer.example.lab",
 		Audience:        "calibration-bundles-api",
 		Subject:         "partner-lab-alpha",
-		IssuerJWK:       pubPath,
+		IssuerJWK:       jwkPath,
 		AccessLeewaySec: 30,
 		DPoPMaxAgeSec:   60,
 		DPoPLeewaySec:   30,
@@ -106,6 +114,10 @@ func setup(t *testing.T) *harness {
 }
 
 func (h *harness) mint(jti string) (token, proof string) {
+	return h.mintWithKid(jti, "")
+}
+
+func (h *harness) mintWithKid(jti, kid string) (token, proof string) {
 	now := time.Now().UTC()
 	x, y := jwx.XY(&h.dpop.PublicKey)
 	jkt := jwx.ThumbprintB64(x, y)
@@ -118,10 +130,12 @@ func (h *harness) mint(jti string) (token, proof string) {
 		"scope": "bundles:read",
 		"cnf":   map[string]any{"jkt": jkt},
 	})
+	header := map[string]any{"alg": "ES256", "typ": "JWT"}
+	if kid != "" {
+		header["kid"] = kid
+	}
 	var err error
-	token, err = jwx.SignCompact(
-		map[string]any{"alg": "ES256", "typ": "JWT"},
-		payload, jwx.ES256Signer{Key: h.issuer})
+	token, err = jwx.SignCompact(header, payload, jwx.ES256Signer{Key: h.issuer})
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -267,5 +281,196 @@ func TestHealth(t *testing.T) {
 	rr := h.get("", "", "/healthz")
 	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"ok"`) {
 		t.Fatalf("health: %d %s", rr.Code, rr.Body.String())
+	}
+}
+
+// publicJWKEntry renders one JWKS entry for key, with an optional kid.
+func publicJWKEntry(t *testing.T, key *ecdsa.PrivateKey, kid string) map[string]any {
+	t.Helper()
+	x, y := jwx.XY(&key.PublicKey)
+	entry := map[string]any{
+		"kty": "EC", "crv": "P-256",
+		"x": jwx.Encode(x), "y": jwx.Encode(y),
+	}
+	if kid != "" {
+		entry["kid"] = kid
+	}
+	return entry
+}
+
+// writeJWKS stores a {"keys":[...]} document and returns its path.
+func writeJWKS(t *testing.T, dir string, entries ...map[string]any) string {
+	t.Helper()
+	doc, err := json.Marshal(map[string]any{"keys": entries})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "jwks.json")
+	if err := os.WriteFile(path, doc, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// assertExactDownload requires a 200 response whose body and digest headers
+// match the prepared evidence exactly.
+func assertExactDownload(t *testing.T, h *harness, rr *httptest.ResponseRecorder) {
+	t.Helper()
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	body, _ := io.ReadAll(rr.Body)
+	if string(body) != string(h.evidence) {
+		t.Fatalf("evidence bytes mismatch: got %d bytes, want %d", len(body), len(h.evidence))
+	}
+	if got := rr.Header().Get("X-Bundle-SHA-256"); got != h.digest {
+		t.Fatalf("X-Bundle-SHA-256 = %s, want %s", got, h.digest)
+	}
+	if !strings.HasPrefix(rr.Header().Get("Digest"), "sha-256=") {
+		t.Fatalf("Digest header missing/wrong: %q", rr.Header().Get("Digest"))
+	}
+}
+
+// The reported rotation scenario: the JWKS lists a valid but unused key
+// first and the current signing key second; the caller signs with the second
+// key and presents a correctly bound DPoP proof.
+func TestJWKSRotationSigningKeyAtAnyPosition(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		issuerFirst bool
+	}{
+		{"signing key is second JWKS entry", false},
+		{"signing key is first JWKS entry", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			issuer, err := minting.GenerateP256()
+			if err != nil {
+				t.Fatal(err)
+			}
+			unused, err := minting.GenerateP256()
+			if err != nil {
+				t.Fatal(err)
+			}
+			entries := []map[string]any{
+				publicJWKEntry(t, unused, "standby"),
+				publicJWKEntry(t, issuer, "current"),
+			}
+			if tc.issuerFirst {
+				entries[0], entries[1] = entries[1], entries[0]
+			}
+			h := newHarness(t, issuer, writeJWKS(t, dir, entries...), dir)
+
+			token, proof := h.mint("jti-rotation")
+			assertExactDownload(t, h, h.get(token, proof, h.path))
+		})
+	}
+}
+
+func TestJWKSKidSelectsRegisteredKey(t *testing.T) {
+	dir := t.TempDir()
+	issuer, err := minting.GenerateP256()
+	if err != nil {
+		t.Fatal(err)
+	}
+	unused, err := minting.GenerateP256()
+	if err != nil {
+		t.Fatal(err)
+	}
+	jwksPath := writeJWKS(t, dir,
+		publicJWKEntry(t, unused, "standby"),
+		publicJWKEntry(t, issuer, "current"),
+	)
+	h := newHarness(t, issuer, jwksPath, dir)
+
+	// A token carrying the registered kid verifies deterministically.
+	token, proof := h.mintWithKid("jti-kid-ok", "current")
+	assertExactDownload(t, h, h.get(token, proof, h.path))
+
+	// An unknown kid is rejected with the existing invalid_token semantics.
+	token, proof = h.mintWithKid("jti-kid-unknown", "no-such-key")
+	rr := h.get(token, proof, h.path)
+	if rr.Code != http.StatusUnauthorized || errCode(rr.Body) != "invalid_token" {
+		t.Fatalf("unknown kid: want 401 invalid_token, got %d %s", rr.Code, rr.Body.String())
+	}
+
+	// A kid that pins the non-signing registered key is rejected too.
+	token, proof = h.mintWithKid("jti-kid-wrong", "standby")
+	rr = h.get(token, proof, h.path)
+	if rr.Code != http.StatusUnauthorized || errCode(rr.Body) != "invalid_token" {
+		t.Fatalf("kid of the non-signing key: want 401 invalid_token, got %d %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestSingleEntryJWKSStillServes(t *testing.T) {
+	dir := t.TempDir()
+	issuer, err := minting.GenerateP256()
+	if err != nil {
+		t.Fatal(err)
+	}
+	jwksPath := writeJWKS(t, dir, publicJWKEntry(t, issuer, "only"))
+	h := newHarness(t, issuer, jwksPath, dir)
+
+	token, proof := h.mint("jti-single")
+	assertExactDownload(t, h, h.get(token, proof, h.path))
+}
+
+func TestJWKSDuplicateKidIsAmbiguous(t *testing.T) {
+	dir := t.TempDir()
+	issuer, err := minting.GenerateP256()
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := minting.GenerateP256()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two distinct keys registered under the same kid: not uniquely matchable.
+	jwksPath := writeJWKS(t, dir,
+		publicJWKEntry(t, issuer, "dup"),
+		publicJWKEntry(t, other, "dup"),
+	)
+	h := newHarness(t, issuer, jwksPath, dir)
+
+	token, proof := h.mintWithKid("jti-dup-kid", "dup")
+	rr := h.get(token, proof, h.path)
+	if rr.Code != http.StatusUnauthorized || errCode(rr.Body) != "invalid_token" {
+		t.Fatalf("ambiguous kid: want 401 invalid_token, got %d %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestUnusableIssuerKeyDocumentFailsStartup(t *testing.T) {
+	dir := t.TempDir()
+	body := []byte("x")
+	p := filepath.Join(dir, "01-a.txt")
+	if err := os.WriteFile(p, body, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	d := sha256.Sum256(body)
+	cfg := &config.Config{
+		PublicOrigin:    "https://api.example.lab",
+		Issuer:          "https://issuer.example.lab",
+		Audience:        "calibration-bundles-api",
+		Subject:         "partner-lab-alpha",
+		IssuerJWK:       filepath.Join(dir, "broken.json"),
+		AccessLeewaySec: 30,
+		DPoPMaxAgeSec:   60,
+		DPoPLeewaySec:   30,
+		Bundles: []config.Bundle{{
+			ID:    "B-1",
+			Files: []config.File{{Number: 1, Path: p, SHA256: hex.EncodeToString(d[:])}},
+		}},
+	}
+	if err := os.WriteFile(cfg.IssuerJWK, []byte(`{"keys":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	replay, err := store.Open(filepath.Join(dir, "replay"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replay.Close()
+	srv, err := server.New(cfg, replay)
+	if err == nil || srv != nil {
+		t.Fatal("a key document without any usable key must fail startup")
 	}
 }

@@ -54,6 +54,10 @@ func newRig(t *testing.T) *rig {
 }
 
 func (r *rig) accessToken(mutate func(m map[string]any), signKey *ecdsa.PrivateKey) string {
+	return r.accessTokenWithKid(mutate, signKey, "")
+}
+
+func (r *rig) accessTokenWithKid(mutate func(m map[string]any), signKey *ecdsa.PrivateKey, kid string) string {
 	claims := map[string]any{
 		"iss":   r.params.ExpectedIssuer,
 		"sub":   r.params.ExpectedSubject,
@@ -70,7 +74,11 @@ func (r *rig) accessToken(mutate func(m map[string]any), signKey *ecdsa.PrivateK
 		signKey = r.issuer
 	}
 	pb, _ := json.Marshal(claims)
-	tok, err := jwx.SignCompact(map[string]any{"alg": "ES256", "typ": "JWT"}, pb, jwx.ES256Signer{Key: signKey})
+	header := map[string]any{"alg": "ES256", "typ": "JWT"}
+	if kid != "" {
+		header["kid"] = kid
+	}
+	tok, err := jwx.SignCompact(header, pb, jwx.ES256Signer{Key: signKey})
 	if err != nil {
 		r.t.Fatal(err)
 	}
@@ -327,6 +335,134 @@ func TestMalformedInputs(t *testing.T) {
 
 func r_now() time.Time {
 	return time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+}
+
+// regKey registers pub as an issuer verification key with an optional kid.
+func regKey(pub *ecdsa.PublicKey, kid string) jwx.RegisteredKey {
+	return jwx.RegisteredKey{Public: pub, Kid: kid}
+}
+
+// useKeys switches the rig to an explicit registered key set (JWKS mode).
+func (r *rig) useKeys(keys ...jwx.RegisteredKey) {
+	r.params.IssuerKey = nil
+	r.params.IssuerKeys = keys
+}
+
+func TestMultipleIssuerKeysWithoutKid(t *testing.T) {
+	r := newRig(t)
+	rotated, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+
+	// The signing key is the SECOND JWKS entry; order must not matter.
+	for _, order := range []string{"signing key second", "signing key first"} {
+		t.Run(order, func(t *testing.T) {
+			keys := []jwx.RegisteredKey{
+				regKey(&rotated.PublicKey, ""),
+				regKey(&r.issuer.PublicKey, ""),
+			}
+			if order == "signing key first" {
+				keys[0], keys[1] = keys[1], keys[0]
+			}
+			r.useKeys(keys...)
+			tok := r.accessToken(nil, nil)
+			proof := r.proof(tok, proofOpts{})
+			if _, err := auth.Verify(tok, proof, r.params); err != nil {
+				t.Fatalf("token signed by a registered key must verify regardless of position: %v", err)
+			}
+		})
+	}
+}
+
+func TestMultipleIssuerKeysWithKid(t *testing.T) {
+	r := newRig(t)
+	rotated, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	r.useKeys(
+		regKey(&rotated.PublicKey, "old"),
+		regKey(&r.issuer.PublicKey, "current"),
+	)
+
+	t.Run("kid selects the matching registered key", func(t *testing.T) {
+		tok := r.accessTokenWithKid(nil, nil, "current")
+		proof := r.proof(tok, proofOpts{})
+		if _, err := auth.Verify(tok, proof, r.params); err != nil {
+			t.Fatalf("kid-bound token must verify: %v", err)
+		}
+	})
+
+	t.Run("kid does not fall back to other keys", func(t *testing.T) {
+		// Signed by r.issuer ("current") but claims the "old" kid.
+		tok := r.accessTokenWithKid(nil, nil, "old")
+		proof := r.proof(tok, proofOpts{})
+		_, err := auth.Verify(tok, proof, r.params)
+		ae, ok := auth.AsError(err)
+		if !ok || ae.Code != auth.CodeInvalidToken {
+			t.Fatalf("kid pinning the wrong key must fail with invalid_token, got %v", err)
+		}
+	})
+
+	t.Run("unknown kid rejected", func(t *testing.T) {
+		tok := r.accessTokenWithKid(nil, nil, "no-such-key")
+		proof := r.proof(tok, proofOpts{})
+		_, err := auth.Verify(tok, proof, r.params)
+		ae, ok := auth.AsError(err)
+		if !ok || ae.Code != auth.CodeInvalidToken {
+			t.Fatalf("unknown kid must fail with invalid_token, got %v", err)
+		}
+	})
+
+	t.Run("ambiguous kid rejected", func(t *testing.T) {
+		other, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		r.useKeys(
+			regKey(&r.issuer.PublicKey, "dup"),
+			regKey(&other.PublicKey, "dup"),
+		)
+		tok := r.accessTokenWithKid(nil, nil, "dup")
+		proof := r.proof(tok, proofOpts{})
+		_, err := auth.Verify(tok, proof, r.params)
+		ae, ok := auth.AsError(err)
+		if !ok || ae.Code != auth.CodeInvalidToken {
+			t.Fatalf("ambiguous kid must fail with invalid_token, got %v", err)
+		}
+	})
+
+	t.Run("non-string kid rejected", func(t *testing.T) {
+		r.useKeys(regKey(&r.issuer.PublicKey, "current"))
+		claims := map[string]any{
+			"iss": r.params.ExpectedIssuer, "sub": r.params.ExpectedSubject,
+			"aud": r.params.ExpectedAudience,
+			"iat": r.now.Add(-10 * time.Second).Unix(), "exp": r.now.Add(2 * time.Minute).Unix(),
+			"scope": "bundles:read", "cnf": map[string]any{"jkt": r.jkt},
+		}
+		pb, _ := json.Marshal(claims)
+		tok, err := jwx.SignCompact(
+			map[string]any{"alg": "ES256", "typ": "JWT", "kid": 42},
+			pb, jwx.ES256Signer{Key: r.issuer})
+		if err != nil {
+			t.Fatal(err)
+		}
+		proof := r.proof(tok, proofOpts{})
+		_, verr := auth.Verify(tok, proof, r.params)
+		ae, ok := auth.AsError(verr)
+		if !ok || ae.Code != auth.CodeInvalidToken {
+			t.Fatalf("non-string kid must fail with invalid_token, got %v", verr)
+		}
+	})
+}
+
+func TestMultipleIssuerKeysForeignSignatureRejected(t *testing.T) {
+	r := newRig(t)
+	rotated, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	foreign, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	r.useKeys(
+		regKey(&rotated.PublicKey, ""),
+		regKey(&r.issuer.PublicKey, ""),
+	)
+	tok := r.accessToken(nil, foreign)
+	proof := r.proof(tok, proofOpts{})
+	_, err := auth.Verify(tok, proof, r.params)
+	ae, ok := auth.AsError(err)
+	if !ok || ae.Code != auth.CodeInvalidToken {
+		t.Fatalf("signature from an unregistered key must fail with invalid_token, got %v", err)
+	}
 }
 
 func randomHex() string {

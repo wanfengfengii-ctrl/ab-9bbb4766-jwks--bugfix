@@ -72,6 +72,9 @@ type PublicJWK struct {
 	Crv string `json:"crv"`
 	X   string `json:"x"`
 	Y   string `json:"y"`
+	// Kid is the optional JWK key identifier used for deterministic key
+	// selection when a token carries a kid header.
+	Kid string `json:"kid"`
 }
 
 // ParsePublicJWK decodes a P-256 EC public JWK.

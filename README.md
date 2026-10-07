@@ -35,10 +35,16 @@ DPoP:          <ES256 DPoP proof JWT>
 
 ### Access token validation
 
-Registered issuer ES256 public JWK; verified claims: `alg=ES256`, `iss`,
-`aud` (string or array), `sub`, `exp`/`nbf` (with leeway), `scope`/`permissions`
-containing `bundles:read`, and `cnf.jkt` (RFC 7638 SHA-256 thumbprint of the
-caller key).
+Registered issuer ES256 public keys live at `issuer_jwk_path`, either as a
+bare public JWK or as a JWKS (`{"keys":[...]}`). During key rotation several
+P-256 keys may be registered at once: every usable entry has equal
+verification standing regardless of its position in the document. A token
+carrying a `kid` header selects the one registered key with that `kid`
+(unknown or ambiguous `kid`s are rejected with `invalid_token`); a token
+without `kid` may verify against any registered key. Verified claims:
+`alg=ES256`, `iss`, `aud` (string or array), `sub`, `exp`/`nbf` (with
+leeway), `scope`/`permissions` containing `bundles:read`, and `cnf.jkt`
+(RFC 7638 SHA-256 thumbprint of the caller key).
 
 ### DPoP proof validation (RFC 9449, ES256)
 
@@ -123,7 +129,10 @@ Manifest (rendered by keygen; can also be hand-authored):
 
 Rules enforced at load: 1–8 files per bundle, numbers 1–8 unique, digests are
 64 lowercase hex chars matching the on-disk content, evidence must be regular
-non-symlink files without any write bit. Env overrides: `PUBLIC_ORIGIN`,
+non-symlink files without any write bit. `issuer_jwk_path` accepts a bare
+public JWK or a JWKS document; a JWKS must contain at least one usable
+ES256 P-256 key (unusable entries are ignored, key order is irrelevant).
+Env overrides: `PUBLIC_ORIGIN`,
 `ISSUER`, `AUDIENCE`, `SUBJECT`, `ISSUER_JWK_PATH`, `LISTEN_ADDR`/`PORT`,
 `CONFIG_PATH`, `REPLAY_DIR`.
 
